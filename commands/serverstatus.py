@@ -1,3 +1,4 @@
+import asyncio
 import time
 import re
 import discord
@@ -18,6 +19,7 @@ EMBED_COLOR_ON  = 0x57F287   # Discord green
 EMBED_COLOR_OFF = 0xED4245   # Discord red
 EMBED_COLOR_ERR = 0x99AAB5   # Grey for errors
 REQUEST_TIMEOUT = 8           # seconds
+REFRESH_INTERVAL = 30         # seconds between auto-refreshes
 
 # Regex strips Minecraft § colour / formatting codes from MOTDs
 MC_FORMAT_RE = re.compile(r"§[0-9a-fk-or]", re.IGNORECASE)
@@ -50,6 +52,150 @@ def parse_motd(motd_data: dict | str | None) -> str:
     return strip_mc_formatting(joined) or "No MOTD"
 
 
+async def fetch_server_data(ip: str) -> tuple[dict | None, int, str | None]:
+    """
+    Query the mcsrvstat API for the given IP.
+    Returns (data, latency_ms, error_message).
+    data is None and error_message is set on failure.
+    """
+    url = MC_STATUS_API.format(host=ip)
+    t_start = time.monotonic()
+
+    try:
+        if not AIOHTTP_AVAILABLE:
+            raise RuntimeError("`aiohttp` is not installed.")
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                headers={"User-Agent": "FrostWarden-Discord-Bot/1.0"}
+            ) as resp:
+                if resp.status != 200:
+                    raise ValueError(f"API returned HTTP {resp.status}")
+                data: dict = await resp.json(content_type=None)
+
+        latency_ms = round((time.monotonic() - t_start) * 1000)
+        return data, latency_ms, None
+
+    except Exception as exc:
+        latency_ms = round((time.monotonic() - t_start) * 1000)
+        return None, latency_ms, str(exc)
+
+
+def build_online_embed(ip: str, data: dict, api_latency_ms: int) -> tuple[discord.Embed, discord.File | None]:
+    """Build the online server embed. Returns (embed, favicon_file_or_None)."""
+    players_online = data.get("players", {}).get("online", 0)
+    players_max    = data.get("players", {}).get("max", 0)
+    version        = data.get("version", "Unknown")
+    motd           = parse_motd(data.get("motd"))
+    ping_ms        = api_latency_ms
+    tps            = "Unavailable"
+
+    favicon_data_uri: str | None = data.get("icon")
+    favicon_file: discord.File | None = None
+
+    if favicon_data_uri and favicon_data_uri.startswith("data:image/png;base64,"):
+        try:
+            import base64, io
+            raw_b64 = favicon_data_uri.split(",", 1)[1]
+            img_bytes = base64.b64decode(raw_b64)
+            favicon_file = discord.File(io.BytesIO(img_bytes), filename="favicon.png")
+        except Exception:
+            favicon_file = None
+
+    embed = discord.Embed(title="🟢  Server Online", color=EMBED_COLOR_ON)
+    embed.add_field(name="🖥  Server IP",   value=f"`{ip}`",                          inline=False)
+    embed.add_field(name="👥  Players",      value=f"`{players_online}/{players_max}`", inline=True)
+    embed.add_field(name="⚡  TPS",          value=f"`{tps}`",                          inline=True)
+    embed.add_field(name="📡  Ping",         value=f"`{ping_ms} ms`",                   inline=True)
+    embed.add_field(name="🎮  Version",      value=f"`{version}`",                      inline=True)
+    embed.add_field(name="📝  MOTD",         value=f"```{motd}```",                     inline=False)
+    embed.add_field(name="🟢  Status",       value="`Online`",                          inline=True)
+    embed.add_field(name="\u200b",           value="\u200b",                            inline=False)
+    embed.add_field(
+        name="\u2501" * 22,
+        value=f"API response time: **{api_latency_ms} ms**",
+        inline=False
+    )
+    # No footer — "Powered by" line removed
+
+    if favicon_file:
+        embed.set_thumbnail(url="attachment://favicon.png")
+
+    return embed, favicon_file
+
+
+def build_offline_embed(ip: str, api_latency_ms: int) -> discord.Embed:
+    embed = discord.Embed(
+        title="🔴  Server Offline",
+        description=(
+            f"**`{ip}`** is currently **offline** or unreachable.\n"
+            "Double-check the address or try again later."
+        ),
+        color=EMBED_COLOR_OFF
+    )
+    embed.add_field(
+        name="\u2501" * 22,
+        value=f"API response time: **{api_latency_ms} ms**",
+        inline=False
+    )
+    # No footer — "Powered by" line removed
+    return embed
+
+
+# ─────────────────────────────────────────────
+#  Auto-refresh View
+# ─────────────────────────────────────────────
+class ServerStatusView(discord.ui.View):
+    """
+    Attaches to the status message and refreshes it every REFRESH_INTERVAL seconds.
+    Stops automatically after the message is deleted or the bot restarts.
+    """
+
+    def __init__(self, ip: str, message: discord.Message):
+        super().__init__(timeout=None)  # We manage our own lifecycle
+        self.ip = ip
+        self.message = message
+        self._task = asyncio.create_task(self._refresh_loop())
+
+    async def _refresh_loop(self):
+        """Background task: re-fetch and edit the message every 30 s."""
+        try:
+            while True:
+                await asyncio.sleep(REFRESH_INTERVAL)
+                await self._do_refresh()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass  # Don't crash the bot if something goes wrong
+
+    async def _do_refresh(self):
+        data, latency_ms, error = await fetch_server_data(self.ip)
+
+        if error or data is None or not data.get("online", False):
+            embed = build_offline_embed(self.ip, latency_ms)
+            try:
+                await self.message.edit(embed=embed, attachments=[], view=self)
+            except (discord.NotFound, discord.Forbidden):
+                self._task.cancel()  # Message deleted — stop refreshing
+            return
+
+        embed, favicon_file = build_online_embed(self.ip, data, latency_ms)
+
+        try:
+            if favicon_file:
+                await self.message.edit(embed=embed, attachments=[favicon_file], view=self)
+            else:
+                await self.message.edit(embed=embed, attachments=[], view=self)
+        except (discord.NotFound, discord.Forbidden):
+            self._task.cancel()  # Message deleted — stop refreshing
+
+    def stop(self):
+        self._task.cancel()
+        super().stop()
+
+
 # ─────────────────────────────────────────────
 #  Cog
 # ─────────────────────────────────────────────
@@ -66,12 +212,10 @@ class ServerStatusCog(commands.Cog):
         """
         /serverstatus ip:<server_ip>
         Returns a rich embed with player count, version, MOTD, ping, TPS,
-        and server icon — or a red offline embed if the server is unreachable.
+        and server icon — refreshed automatically every 30 seconds.
         """
-        # Defer immediately — API call can take a moment
         await interaction.response.defer()
 
-        # ── Validate / sanitise the IP string ──────────────────────────────
         ip = ip.strip()
         if not ip:
             await interaction.followup.send(
@@ -82,113 +226,27 @@ class ServerStatusCog(commands.Cog):
             )
             return
 
-        # ── Query the status API ────────────────────────────────────────────
-        url = MC_STATUS_API.format(host=ip)
-        t_start = time.monotonic()
+        data, latency_ms, error = await fetch_server_data(ip)
 
-        try:
-            if not AIOHTTP_AVAILABLE:
-                raise RuntimeError(
-                    "`aiohttp` is not installed. Run `pip install aiohttp` and restart the bot."
-                )
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url,
-                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-                    headers={"User-Agent": "FrostWarden-Discord-Bot/1.0"}
-                ) as resp:
-                    if resp.status != 200:
-                        raise ValueError(f"API returned HTTP {resp.status}")
-                    data: dict = await resp.json(content_type=None)
-
-        except aiohttp.ClientConnectorError:
-            await interaction.followup.send(embed=self._error_embed(ip, "Could not reach the status API. Check your internet connection."))
-            return
-        except aiohttp.ServerTimeoutError:
-            await interaction.followup.send(embed=self._error_embed(ip, "The status API timed out. Try again in a moment."))
-            return
-        except Exception as exc:
-            await interaction.followup.send(embed=self._error_embed(ip, str(exc)))
+        if error:
+            await interaction.followup.send(embed=self._error_embed(ip, error))
             return
 
-        api_latency_ms = round((time.monotonic() - t_start) * 1000)
-
-        # ── Build the embed ─────────────────────────────────────────────────
         online: bool = data.get("online", False)
 
         if not online:
-            embed = discord.Embed(
-                title="🔴  Server Offline",
-                description=(
-                    f"**`{ip}`** is currently **offline** or unreachable.\n"
-                    "Double-check the address or try again later."
-                ),
-                color=EMBED_COLOR_OFF
-            )
-            embed.set_footer(text=f"API response time: {api_latency_ms} ms  •  Powered by mcsrvstat.us")
-            await interaction.followup.send(embed=embed)
-            return
-
-        # ── Parse fields ────────────────────────────────────────────────────
-        players_online = data.get("players", {}).get("online", 0)
-        players_max    = data.get("players", {}).get("max", 0)
-
-        version        = data.get("version", "Unknown")
-
-        motd_raw       = data.get("motd")
-        motd           = parse_motd(motd_raw)
-
-        # Ping: mcsrvstat doesn't expose raw TCP ping, so we use our API RTT
-        ping_ms        = api_latency_ms
-
-        # TPS: only available via plugins (e.g. Paper/Purpur) — not in the API
-        tps            = "Unavailable"
-
-        # Favicon: mcsrvstat returns a base64 data URI ("data:image/png;base64,...").
-        # Discord embed thumbnail URLs do NOT accept data URIs, so we decode the
-        # bytes and upload the image as a file attachment, then reference it via
-        # the special "attachment://favicon.png" protocol.
-        favicon_data_uri: str | None = data.get("icon")
-        favicon_file: discord.File | None = None
-
-        if favicon_data_uri and favicon_data_uri.startswith("data:image/png;base64,"):
-            try:
-                import base64, io
-                raw_b64 = favicon_data_uri.split(",", 1)[1]
-                img_bytes = base64.b64decode(raw_b64)
-                favicon_file = discord.File(io.BytesIO(img_bytes), filename="favicon.png")
-            except Exception:
-                favicon_file = None  # silently skip on any decode error
-
-        # ── Compose embed ────────────────────────────────────────────────────
-        embed = discord.Embed(
-            title="🟢  Server Online",
-            color=EMBED_COLOR_ON
-        )
-
-        embed.add_field(name="🖥  Server IP",   value=f"`{ip}`",                          inline=False)
-        embed.add_field(name="👥  Players",      value=f"`{players_online}/{players_max}`", inline=True)
-        embed.add_field(name="⚡  TPS",          value=f"`{tps}`",                          inline=True)
-        embed.add_field(name="📡  Ping",         value=f"`{ping_ms} ms`",                   inline=True)
-        embed.add_field(name="🎮  Version",      value=f"`{version}`",                      inline=True)
-        embed.add_field(name="📝  MOTD",         value=f"```{motd}```",                     inline=False)
-        embed.add_field(name="🟢  Status",       value="`Online`",                          inline=True)
-        embed.add_field(name="\u200b",           value="\u200b",                            inline=False)  # spacer
-        embed.add_field(
-            name="\u2501" * 22,  # ━━━━━━━━━━━━━━━━━━━━━━
-            value=f"API response time: **{api_latency_ms} ms**",
-            inline=False
-        )
-
-        embed.set_footer(text="Powered by mcsrvstat.us  •  Minecraft Java Edition")
-
-        # Reference the attached file as thumbnail (attachment:// works for uploaded files)
-        if favicon_file:
-            embed.set_thumbnail(url="attachment://favicon.png")
-            await interaction.followup.send(embed=embed, file=favicon_file)
+            embed = build_offline_embed(ip, latency_ms)
+            msg = await interaction.followup.send(embed=embed, wait=True)
         else:
-            await interaction.followup.send(embed=embed)
+            embed, favicon_file = build_online_embed(ip, data, latency_ms)
+            if favicon_file:
+                msg = await interaction.followup.send(embed=embed, file=favicon_file, wait=True)
+            else:
+                msg = await interaction.followup.send(embed=embed, wait=True)
+
+        # Attach the auto-refresh view (starts background task)
+        view = ServerStatusView(ip=ip, message=msg)
+        await msg.edit(view=view)
 
     # ── Helper ──────────────────────────────────────────────────────────────
     @staticmethod
@@ -199,7 +257,6 @@ class ServerStatusCog(commands.Cog):
             description=f"**Server:** `{ip}`\n**Reason:** {reason}",
             color=EMBED_COLOR_ERR
         )
-        embed.set_footer(text="Powered by mcsrvstat.us")
         return embed
 
 
